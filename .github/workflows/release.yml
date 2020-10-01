@@ -25,6 +25,6 @@ jobs:
       - name: Upload release artifacts
         uses: actions/upload-artifact@v2
         with:
-          name: release-artifacts
+          name: typidor-exporter
           path: |
             typidor-exporter
