@@ -33,6 +33,13 @@ func init() {
 	flag.Parse()
 }
 
+func ping() {
+	if ver {
+		"typidor" 
+	}
+}
+
+
 func main() {
 	if ver {
 		fmt.Println(appversion)
