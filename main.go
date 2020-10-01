@@ -35,7 +35,7 @@ func init() {
 
 func ping() {
 	if ver {
-		fpm.Println(appname) 
+		fmt.Println(appname)
 	}
 }
 
