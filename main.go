@@ -33,12 +33,6 @@ func init() {
 	flag.Parse()
 }
 
-func ping() {
-	if ver {
-		fmt.Println(appname)
-	}
-}
-
 func main() {
 	if ver {
 		fmt.Println(appversion)
