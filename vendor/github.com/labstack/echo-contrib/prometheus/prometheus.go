@@ -22,7 +22,7 @@ package prometheus
 
 import (
 	"bytes"
-	"io/ioutil"
+	"errors"
 	"net/http"
 	"os"
 	"strconv"
@@ -33,6 +33,7 @@ import (
 	"github.com/labstack/gommon/log"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/prometheus/common/expfmt"
 )
 
 var defaultMetricPath = "/metrics"
@@ -52,19 +53,22 @@ var reqDur = &Metric{
 	ID:          "reqDur",
 	Name:        "request_duration_seconds",
 	Description: "The HTTP request latencies in seconds.",
-	Type:        "summary"}
+	Args:        []string{"code", "method", "url"},
+	Type:        "histogram_vec"}
 
 var resSz = &Metric{
 	ID:          "resSz",
 	Name:        "response_size_bytes",
 	Description: "The HTTP response sizes in bytes.",
-	Type:        "summary"}
+	Args:        []string{"code", "method", "url"},
+	Type:        "histogram_vec"}
 
 var reqSz = &Metric{
 	ID:          "reqSz",
 	Name:        "request_size_bytes",
 	Description: "The HTTP request sizes in bytes.",
-	Type:        "summary"}
+	Args:        []string{"code", "method", "url"},
+	Type:        "histogram_vec"}
 
 var standardMetrics = []*Metric{
 	reqCnt,
@@ -74,7 +78,7 @@ var standardMetrics = []*Metric{
 }
 
 /*
-RequestCounterURLLabelMappingFunc is a function which can be supplied to the middleware to control
+RequestCounterLabelMappingFunc is a function which can be supplied to the middleware to control
 the cardinality of the request counter's "url" label, which might be required in some contexts.
 For instance, if for a "/customer/:name" route you don't want to generate a time series for every
 possible customer name, you could use this function:
@@ -91,8 +95,9 @@ func(c echo.Context) string {
 }
 
 which would map "/customer/alice" and "/customer/bob" to their template "/customer/:name".
+It can also be applied for the "Host" label
 */
-type RequestCounterURLLabelMappingFunc func(c echo.Context) string
+type RequestCounterLabelMappingFunc func(c echo.Context) string
 
 // Metric is a definition for the name, description, type, ID, and
 // prometheus.Collector type (i.e. CounterVec, Summary, etc) of each metric
@@ -108,7 +113,7 @@ type Metric struct {
 // Prometheus contains the metrics gathered by the instance and its path
 type Prometheus struct {
 	reqCnt               *prometheus.CounterVec
-	reqDur, reqSz, resSz prometheus.Summary
+	reqDur, reqSz, resSz *prometheus.HistogramVec
 	router               *echo.Echo
 	listenAddress        string
 	Ppg                  PushGateway
@@ -118,7 +123,8 @@ type Prometheus struct {
 	Subsystem   string
 	Skipper     middleware.Skipper
 
-	RequestCounterURLLabelMappingFunc RequestCounterURLLabelMappingFunc
+	RequestCounterURLLabelMappingFunc  RequestCounterLabelMappingFunc
+	RequestCounterHostLabelMappingFunc RequestCounterLabelMappingFunc
 
 	// Context string to use as a prometheus URL label
 	URLLabelFromContext string
@@ -132,10 +138,6 @@ type PushGateway struct {
 	// Push Gateway URL in format http://domain:port
 	// where JOBNAME can be any string of your choice
 	PushGatewayURL string
-
-	// Local metrics URL where metrics are fetched from, this could be ommited in the future
-	// if implemented using prometheus common/expfmt instead
-	MetricsURL string
 
 	// pushgateway job name, defaults to "echo"
 	Job string
@@ -166,6 +168,9 @@ func NewPrometheus(subsystem string, skipper middleware.Skipper, customMetricsLi
 		RequestCounterURLLabelMappingFunc: func(c echo.Context) string {
 			return c.Path() // i.e. by default do nothing, i.e. return URL as is
 		},
+		RequestCounterHostLabelMappingFunc: func(c echo.Context) string {
+			return c.Request().Host
+		},
 	}
 
 	p.registerMetrics(subsystem)
@@ -174,10 +179,9 @@ func NewPrometheus(subsystem string, skipper middleware.Skipper, customMetricsLi
 }
 
 // SetPushGateway sends metrics to a remote pushgateway exposed on pushGatewayURL
-// every pushIntervalSeconds. Metrics are fetched from metricsURL
-func (p *Prometheus) SetPushGateway(pushGatewayURL, metricsURL string, pushIntervalSeconds time.Duration) {
+// every pushIntervalSeconds. Metrics are fetched from
+func (p *Prometheus) SetPushGateway(pushGatewayURL string, pushIntervalSeconds time.Duration) {
 	p.Ppg.PushGatewayURL = pushGatewayURL
-	p.Ppg.MetricsURL = metricsURL
 	p.Ppg.PushIntervalSeconds = pushIntervalSeconds
 	p.startPushTicker()
 }
@@ -222,14 +226,13 @@ func (p *Prometheus) runServer() {
 }
 
 func (p *Prometheus) getMetrics() []byte {
-	response, err := http.Get(p.Ppg.MetricsURL)
-	if err != nil {
-		log.Errorf("Error getting metrics: %v", err)
-	}
-	defer response.Body.Close()
-	body, _ := ioutil.ReadAll(response.Body)
+	out := &bytes.Buffer{}
+	metricFamilies, _ := prometheus.DefaultGatherer.Gather()
+	for i := range metricFamilies {
+		expfmt.MetricFamilyToText(out, metricFamilies[i])
 
-	return body
+	}
+	return out.Bytes()
 }
 
 func (p *Prometheus) getPushGatewayURL() string {
@@ -344,11 +347,11 @@ func (p *Prometheus) registerMetrics(subsystem string) {
 		case reqCnt:
 			p.reqCnt = metric.(*prometheus.CounterVec)
 		case reqDur:
-			p.reqDur = metric.(prometheus.Summary)
+			p.reqDur = metric.(*prometheus.HistogramVec)
 		case resSz:
-			p.resSz = metric.(prometheus.Summary)
+			p.resSz = metric.(*prometheus.HistogramVec)
 		case reqSz:
-			p.reqSz = metric.(prometheus.Summary)
+			p.reqSz = metric.(*prometheus.HistogramVec)
 		}
 		metricDef.MetricCollector = metric
 	}
@@ -362,7 +365,7 @@ func (p *Prometheus) Use(e *echo.Echo) {
 
 // HandlerFunc defines handler function for middleware
 func (p *Prometheus) HandlerFunc(next echo.HandlerFunc) echo.HandlerFunc {
-	return func(c echo.Context) (err error) {
+	return func(c echo.Context) error {
 		if c.Path() == p.MetricsPath {
 			return next(c)
 		}
@@ -373,18 +376,22 @@ func (p *Prometheus) HandlerFunc(next echo.HandlerFunc) echo.HandlerFunc {
 		start := time.Now()
 		reqSz := computeApproximateRequestSize(c.Request())
 
-		if err = next(c); err != nil {
-			c.Error(err)
+		err := next(c)
+
+		status := c.Response().Status
+		if err != nil {
+			var httpError *echo.HTTPError
+			if errors.As(err, &httpError) {
+				status = httpError.Code
+			}
+			if status == 0 || status == http.StatusOK {
+				status = http.StatusInternalServerError
+			}
 		}
 
-		status := strconv.Itoa(c.Response().Status)
-
 		elapsed := float64(time.Since(start)) / float64(time.Second)
-		resSz := float64(c.Response().Size)
 
-		p.reqDur.Observe(elapsed)
 		url := p.RequestCounterURLLabelMappingFunc(c)
-
 		if len(p.URLLabelFromContext) > 0 {
 			u := c.Get(p.URLLabelFromContext)
 			if u == nil {
@@ -393,11 +400,15 @@ func (p *Prometheus) HandlerFunc(next echo.HandlerFunc) echo.HandlerFunc {
 			url = u.(string)
 		}
 
-		p.reqCnt.WithLabelValues(status, c.Request().Method, c.Request().Host, url).Inc()
-		p.reqSz.Observe(float64(reqSz))
-		p.resSz.Observe(resSz)
+		statusStr := strconv.Itoa(status)
+		p.reqDur.WithLabelValues(statusStr, c.Request().Method, url).Observe(elapsed)
+		p.reqCnt.WithLabelValues(statusStr, c.Request().Method, p.RequestCounterHostLabelMappingFunc(c), url).Inc()
+		p.reqSz.WithLabelValues(statusStr, c.Request().Method, url).Observe(float64(reqSz))
 
-		return
+		resSz := float64(c.Response().Size)
+		p.resSz.WithLabelValues(statusStr, c.Request().Method, url).Observe(resSz)
+
+		return err
 	}
 }
 
